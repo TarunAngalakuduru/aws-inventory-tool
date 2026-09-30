@@ -1,0 +1,6 @@
+# never commit secrets, logs or usage data
+.streamlit/secrets.toml
+uasge_log.json
+app.log
+__pycahce__/
+*.pyc
