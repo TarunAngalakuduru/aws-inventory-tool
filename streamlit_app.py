@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 import boto3
 import pandas as pd
 import streamlit as st
+from botocore.exceptions import ClientError
 
 st.set_page_config(page_title="AWS Inventory AI", page_icon="☁️", layout="wide")
 
@@ -58,14 +59,28 @@ def fresh_store():
             "since": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "history": []}
 
 
+def usage_warn(msg):
+    """Remember a storage problem so the usage panel can show it."""
+    st.session_state.usage_warning = msg
+
+
+def s3_client():
+    return boto3.client("s3", region_name=core.BEDROCK_REGION)
+
+
 def load_usage():
     """Read saved usage (S3 first if configured, then local file, else empty)."""
+    st.session_state.pop("usage_warning", None)
     if USAGE_BUCKET:
         try:
-            body = boto3.client("s3", region_name=core.BEDROCK_REGION).get_object(Bucket=USAGE_BUCKET, Key=USAGE_KEY)["Body"].read()
+            body = s3_client().get_object(Bucket=USAGE_BUCKET, Key=USAGE_KEY)["Body"].read()
             return json.loads(body)
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code not in ("NoSuchKey", "404"):              # NoSuchKey = first run, that's normal
+                usage_warn(f"Could not read usage from S3 ({code}). Check bucket name and s3:GetObject permission.")
         except Exception as e:
-            core.log.warning("Usage S3 load failed (using file): %s", e)
+            usage_warn(f"Could not read usage from S3: {e}")
     try:
         with open(USAGE_FILE) as f:
             return json.load(f)
@@ -82,10 +97,12 @@ def save_usage(store):
         core.log.warning("Usage file save failed: %s", e)
     if USAGE_BUCKET:
         try:
-            boto3.client("s3", region_name=core.BEDROCK_REGION).put_object(Bucket=USAGE_BUCKET, Key=USAGE_KEY,
-                                          Body=json.dumps(store).encode(), ContentType="application/json")
+            s3_client().put_object(Bucket=USAGE_BUCKET, Key=USAGE_KEY,
+                                   Body=json.dumps(store).encode(), ContentType="application/json")
+        except ClientError as e:
+            usage_warn(f"Could not save usage to S3 ({e.response['Error']['Code']}). Check s3:PutObject permission.")
         except Exception as e:
-            core.log.warning("Usage S3 save failed: %s", e)
+            usage_warn(f"Could not save usage to S3: {e}")
 
 
 def cost_of(inp, out):
@@ -198,7 +215,7 @@ def connect(region, role, access_key="", secret_key="", token=""):
     session, who = core.make_session(region, role, access_key, secret_key, token)
     st.session_state.update(
         session=session, who=who, region=region, history=[], chat=[],
-        bedrock=boto3.client("bedrock-runtime", region_name=core.BEDROCK_REGION))
+        bedrock=core.make_bedrock_client())
 
 
 def sidebar():
@@ -243,6 +260,11 @@ def token_footer():
     last = hist[-1] if hist else {"input": 0, "output": 0, "cost": 0.0, "question": "-"}
     st.divider()
     st.subheader("Nova token usage & cost")
+    if st.session_state.get("usage_warning"):
+        st.warning(st.session_state.usage_warning)
+    elif not USAGE_BUCKET:
+        st.info("Usage is saved on the app's temporary disk and is lost when Streamlit restarts, redeploys or "
+                "sleeps the app. Add USAGE_S3_BUCKET in Secrets to keep it permanently.")
     st.caption(f"Last question: “{last['question']}”")
     a = st.columns(4)
     a[0].metric("Last - input tokens", f"{last['input']:,}")
