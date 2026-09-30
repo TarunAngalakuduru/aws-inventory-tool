@@ -233,6 +233,21 @@ def redact(obj, parent=""):
     return obj
 
 
+# Cost Explorer console excludes these charge types by default; we do the same so numbers match.
+EXCLUDE_RECORD_TYPES = {"Not": {"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit", "Refund"]}}}
+
+
+def apply_cost_filter(params):
+    """Add a RECORD_TYPE filter (exclude Credit + Refund) to a get_cost_and_usage request.
+    Existing filters are kept (combined with And). If the request already filters on RECORD_TYPE
+    (e.g. the user asked to include credits) it is left untouched. Returns (params, was_added)."""
+    existing = params.get("Filter")
+    if existing and "RECORD_TYPE" in json.dumps(existing, default=str):
+        return params, False
+    params["Filter"] = {"And": [existing, EXCLUDE_RECORD_TYPES]} if existing else EXCLUDE_RECORD_TYPES
+    return params, True
+
+
 def human_bytes(n):
     """Exact, readable size (1024-based, same as the S3 console)."""
     v, i = float(n), 0
@@ -271,6 +286,9 @@ def tool_call_operation(session, default_region, service, operation, params, reg
         raise ToolError(f"'{region}' is not a valid AWS region name (example: ap-south-1).")
     params = {k: v for k, v in (params or {}).items() if v not in (None, "")}  # never send Bucket=""
     params = coerce_params(service, operation, params)
+    cost_filter_added = False
+    if service == "ce" and operation == "get_cost_and_usage":
+        params, cost_filter_added = apply_cost_filter(params)
     client = session.client(service, region_name=region or default_region)
     log.info("AWS service=%s operation=%s final params=%s", service, operation, params)
 
@@ -281,6 +299,9 @@ def tool_call_operation(session, default_region, service, operation, params, reg
         resp = getattr(client, operation)(**params)
     resp.pop("ResponseMetadata", None)
     resp = enrich_response(service, operation, resp)
+    if cost_filter_added:
+        resp["FilterApplied"] = ("RECORD_TYPE filter excluded Credit and Refund charges "
+                                 "(same as the Cost Explorer console default). Mention this in your answer.")
     if resp and all(isinstance(v, list) and not v for v in resp.values()):   # every list is empty
         resp["Note"] = (f"Empty result from {service}.{operation} in region '{region or default_region}' "
                         f"with parameters {params or 'none (no filters, all states)'}. No matching resources exist "
@@ -360,6 +381,7 @@ How to work:
 Hints:
 - Costs: ce get_cost_and_usage with TimePeriod {{"Start":"YYYY-MM-DD","End":"YYYY-MM-DD"}} (End is exclusive),
   Granularity MONTHLY, Metrics ["UnblendedCost"]; for per-service use GroupBy [{{"Type":"DIMENSION","Key":"SERVICE"}}].
+  The app automatically excludes Credit and Refund charge types (RECORD_TYPE filter) - do not add that filter yourself unless the user asks to include credits.
   "This month" = first day of current month to tomorrow. Budgets: service budgets, operation describe_budgets (needs AccountId).
 - Bucket size / storage used (needs a bucket name): (1) s3 get_bucket_location -> bucket region (empty = us-east-1).
   (2) cloudwatch list_metrics with region = bucket region, Namespace AWS/S3, MetricName BucketSizeBytes,
