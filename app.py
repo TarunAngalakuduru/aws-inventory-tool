@@ -181,6 +181,35 @@ def tool_search_operations(service, query):
 # =====================================================================
 # 5. API EXECUTION  (safe, generic - runs whatever operation the AI chose)
 # =====================================================================
+def human_bytes(n):
+    """Exact, readable size (1024-based, same as the S3 console)."""
+    v, i = float(n), 0
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    while v >= 1024 and i < len(units) - 1:
+        v /= 1024
+        i += 1
+    return f"{v:.2f} {units[i]}"
+
+
+def enrich_response(service, operation, resp):
+    """Generic post-processing so the AI never has to do maths or guess:
+    CloudWatch datapoints -> add the latest value (with readable size), or a hint if empty."""
+    if service == "cloudwatch" and operation == "get_metric_statistics":
+        pts = sorted(resp.get("Datapoints", []), key=lambda d: d["Timestamp"])
+        if not pts:
+            resp["Note"] = ("No datapoints returned. S3 metrics exist only in the bucket's own region "
+                            "(pass region = s3 get_bucket_location) and need a valid StorageType "
+                            "(find them with cloudwatch list_metrics). BucketSizeBytes is reported once per day.")
+        else:
+            last = pts[-1]
+            stat = next((k for k in ("Average", "Sum", "Maximum", "Minimum") if k in last), None)
+            latest = {"Timestamp": str(last["Timestamp"]), "Value": last.get(stat), "Unit": last.get("Unit")}
+            if last.get("Unit") == "Bytes" and stat:
+                latest["HumanReadable"] = human_bytes(last[stat])
+            resp["LatestDatapoint"] = latest
+    return resp
+
+
 def tool_call_operation(session, default_region, service, operation, params, region=None):
     service_allowed(service)
     if operation not in read_only_operations(service):            # read-only safety check
@@ -196,6 +225,7 @@ def tool_call_operation(session, default_region, service, operation, params, reg
     else:
         resp = getattr(client, operation)(**params)
     resp.pop("ResponseMetadata", None)
+    resp = enrich_response(service, operation, resp)
     if service == "lambda" and isinstance(resp.get("Code"), dict):
         resp["Code"].pop("Location", None)                        # hide presigned code-download URL
     log.info("AWS API executed OK")
@@ -242,8 +272,10 @@ def system_prompt():
     return f"""You are a read-only AWS inventory assistant. Current time: {now}.
 How to work:
 1. Find the API: call list_aws_services if unsure of the service name, then search_aws_operations, then call_aws_operation.
-2. If a required parameter is missing (bucket name, instance id, function name...), ask the user in plain text. Never guess values.
-3. For "all buckets/instances/..." questions: first list them, then call the detail API for each one.
+2. If the question is about ONE resource property (a bucket's size, type, versioning, encryption; an instance's details...)
+   and the user did NOT name the resource, STOP and ask in plain text (for S3: "Enter S3 bucket name:").
+   Do NOT list resources or loop through all of them to guess. Never guess values.
+3. Only when the user says "all", "every" or "each" (e.g. "all buckets"): first list them, then call the detail API for each one.
 4. Use only data returned by tools. NEVER estimate, calculate or invent prices/costs from your own knowledge.
    For ANY cost, billing, spend or invoice question you MUST call the Cost Explorer API (service ce) first. If nothing is found, say clearly that no resources were found.
 5. If access is denied, state exactly which permission/action is missing.
@@ -253,16 +285,21 @@ How to work:
    Bucket : name
    Created: 2026-01-15
    Never show raw JSON. Never output <thinking> content.
-7. Keep answers SHORT: a brief summary with key fields only (max ~15 lines). The app shows the complete data as a
-   table under your answer, so do not list every field or every resource in detail.
+7. Keep wording brief (max ~15 lines) - the app shows the complete data as a table under your answer.
+   But ALWAYS give exact values from the tools (names, sizes, counts, dates). Never round, estimate or omit numbers.
+   If a tool result contains NextToken, the list is partial (first 100 items): say so.
 Hints:
 - Costs: ce get_cost_and_usage with TimePeriod {{"Start":"YYYY-MM-DD","End":"YYYY-MM-DD"}} (End is exclusive),
   Granularity MONTHLY, Metrics ["UnblendedCost"]; for per-service use GroupBy [{{"Type":"DIMENSION","Key":"SERVICE"}}].
   "This month" = first day of current month to tomorrow. Budgets: service budgets, operation describe_budgets (needs AccountId).
-- Bucket size / storage used: cloudwatch get_metric_statistics, Namespace AWS/S3, MetricName BucketSizeBytes,
-  Dimensions [BucketName, StorageType=StandardStorage], Period 86400, Statistics [Average], last 30 days
-  (StartTime/EndTime as ISO strings). Pass region = the bucket's region (s3 get_bucket_location; empty means us-east-1).
-- Storage class of objects: s3 list_objects_v2 returns StorageClass per object (size is NOT storage class).
+- Bucket size / storage used (needs a bucket name): (1) s3 get_bucket_location -> bucket region (empty = us-east-1).
+  (2) cloudwatch list_metrics with region = bucket region, Namespace AWS/S3, MetricName BucketSizeBytes,
+  Dimensions [{{"Name":"BucketName","Value":"<bucket>"}}] -> shows which StorageTypes the bucket has.
+  (3) For EACH StorageType call cloudwatch get_metric_statistics with region = bucket region, Namespace AWS/S3,
+  MetricName BucketSizeBytes, Dimensions BucketName + StorageType, Period 86400, Statistics ["Average"],
+  StartTime = 7 days ago, EndTime = now (ISO strings). Use each result's LatestDatapoint.HumanReadable.
+  (4) Report each StorageType and the total (add the byte values). If no StorageType is listed, the bucket is empty or has no metrics yet.
+- Storage class / storage type / "bucket type" (needs a bucket name): s3 list_objects_v2 returns StorageClass per object for that ONE bucket (size is NOT storage class).
 - Bucket versioning with no Status means versioning was never enabled."""
 
 
