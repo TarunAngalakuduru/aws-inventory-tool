@@ -281,6 +281,10 @@ def tool_call_operation(session, default_region, service, operation, params, reg
         resp = getattr(client, operation)(**params)
     resp.pop("ResponseMetadata", None)
     resp = enrich_response(service, operation, resp)
+    if resp and all(isinstance(v, list) and not v for v in resp.values()):   # every list is empty
+        resp["Note"] = (f"Empty result from {service}.{operation} in region '{region or default_region}' "
+                        f"with parameters {params or 'none (no filters, all states)'}. No matching resources exist "
+                        "in THIS region. This is not a permission error. Resources are region-specific.")
     if service == "lambda" and isinstance(resp.get("Code"), dict):
         resp["Code"].pop("Location", None)                        # hide presigned code-download URL
     resp = redact(resp)                                           # hide secrets before AI / UI see them
@@ -335,8 +339,14 @@ How to work:
    and the user did NOT name the resource, STOP and ask in plain text (for S3: "Enter S3 bucket name:").
    Do NOT list resources or loop through all of them to guess. Never guess values.
 3. Only when the user says "all", "every" or "each" (e.g. "all buckets"): first list them, then call the detail API for each one.
+   If the user says "all regions": get region names with ec2 describe_regions, then call the operation once per region (region parameter).
 4. Use only data returned by tools. NEVER estimate, calculate or invent prices/costs from your own knowledge.
-   For ANY cost, billing, spend or invoice question you MUST call the Cost Explorer API (service ce) first. If nothing is found, say clearly that no resources were found.
+   For ANY cost, billing, spend or invoice question you MUST call the Cost Explorer API (service ce) first.
+   EMPTY RESULTS: never reply with one bare line like "There are no EC2 instances running." Instead say, in 2-3 lines:
+   what was checked (service + operation), the region, and that nothing exists there, e.g.
+   "No EC2 instances found in ap-south-1 (checked ec2 describe_instances, all states, no filters)."
+   Do NOT say "running", "available" or "active" unless you filtered by that state or the data shows it.
+   Then add: "Resources are region-specific - tell me another region, or say 'all regions', to check elsewhere."
 5. If access is denied, state exactly which permission/action is missing.
 6. Present results as clean readable text, for example:
    S3 Buckets
