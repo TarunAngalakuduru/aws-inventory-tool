@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 import boto3
 import botocore.session
 from botocore import xform_name
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 # =====================================================================
@@ -142,7 +143,7 @@ def read_only_operations(service):
                 members = list(op.input_shape.members) if op.input_shape else []
                 required = list(op.input_shape.required_members) if op.input_shape else []
                 doc = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", op.documentation or "")).strip()
-                ops[snake] = {"required": required, "all_params": members[:20], "doc": doc[:160]}
+                ops[snake] = {"required": required, "all_params": members[:20], "doc": doc[:160], "api_name": name}
         _op_cache[service] = ops
     return _op_cache[service]
 
@@ -181,6 +182,57 @@ def tool_search_operations(service, query):
 # =====================================================================
 # 5. API EXECUTION  (safe, generic - runs whatever operation the AI chose)
 # =====================================================================
+def make_bedrock_client():
+    """Bedrock client with automatic retries (handles throttling) and a longer timeout."""
+    return boto3.client("bedrock-runtime", region_name=BEDROCK_REGION,
+                        config=Config(retries={"max_attempts": 5, "mode": "adaptive"}, read_timeout=120))
+
+
+def coerce_params(service, operation, params):
+    """The AI sometimes sends numbers/booleans/lists as text. Convert them to the type AWS expects."""
+    api_name = read_only_operations(service)[operation]["api_name"]
+    shape = _botocore.get_service_model(service).operation_model(api_name).input_shape
+    if not shape:
+        return params
+    for k, v in list(params.items()):
+        member = shape.members.get(k)
+        if member is None or not isinstance(v, str):
+            continue
+        try:
+            if member.type_name in ("integer", "long"):
+                params[k] = int(v)
+            elif member.type_name in ("float", "double"):
+                params[k] = float(v)
+            elif member.type_name == "boolean":
+                params[k] = v.strip().lower() == "true"
+            elif member.type_name in ("list", "structure", "map"):
+                params[k] = json.loads(v)
+        except ValueError:
+            pass                                              # leave as is; AWS validation will explain
+    return params
+
+
+SENSITIVE_KEYS = {"UserData", "PasswordData", "MasterUserPassword", "Password",
+                  "SecretString", "SecretAccessKey", "SessionToken"}
+
+
+def redact(obj, parent=""):
+    """Hide secrets in AWS responses (Lambda environment variables, EC2 user-data, passwords, ...)."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in SENSITIVE_KEYS:
+                out[k] = "***REDACTED***"
+            elif parent == "Environment" and k == "Variables" and isinstance(v, dict):
+                out[k] = {name: "***REDACTED***" for name in v}
+            else:
+                out[k] = redact(v, k)
+        return out
+    if isinstance(obj, list):
+        return [redact(x, parent) for x in obj]
+    return obj
+
+
 def human_bytes(n):
     """Exact, readable size (1024-based, same as the S3 console)."""
     v, i = float(n), 0
@@ -215,7 +267,10 @@ def tool_call_operation(session, default_region, service, operation, params, reg
     if operation not in read_only_operations(service):            # read-only safety check
         raise ToolError(f"'{operation}' is not an allowed read-only operation for {service}. "
                         "Use search_aws_operations to get valid names.")
+    if region and not re.fullmatch(r"[a-z]{2}(-[a-z]+)+-\d", region):
+        raise ToolError(f"'{region}' is not a valid AWS region name (example: ap-south-1).")
     params = {k: v for k, v in (params or {}).items() if v not in (None, "")}  # never send Bucket=""
+    params = coerce_params(service, operation, params)
     client = session.client(service, region_name=region or default_region)
     log.info("AWS service=%s operation=%s final params=%s", service, operation, params)
 
@@ -228,6 +283,7 @@ def tool_call_operation(session, default_region, service, operation, params, reg
     resp = enrich_response(service, operation, resp)
     if service == "lambda" and isinstance(resp.get("Code"), dict):
         resp["Code"].pop("Location", None)                        # hide presigned code-download URL
+    resp = redact(resp)                                           # hide secrets before AI / UI see them
     log.info("AWS API executed OK")
     return resp
 
@@ -262,6 +318,9 @@ def run_tool(name, args, session, region, capture=None):
     except (ClientError, BotoCoreError) as e:                     # AWS errors go back to the AI to explain
         log.error("AWS API error: %s", e)
         return friendly_error(e), "error"
+    except Exception as e:                                        # unexpected bug: tell the AI, don't crash
+        log.exception("Unexpected tool error")
+        return f"Unexpected error while running {name}: {e}", "error"
 
 
 # =====================================================================
@@ -384,7 +443,7 @@ def main():
     role_arn = input("IAM Role ARN (leave blank to use CLI credentials): ").strip()
     try:
         session, who = make_session(region, role_arn)
-        bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+        bedrock = make_bedrock_client()
     except AppError as e:
         print(f"Error: {e}")
         return
